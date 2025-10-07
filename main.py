@@ -139,7 +139,7 @@ async def fallback_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Ok! Dimmi se vuoi che *metta in agenda*, faccia un *recap*, *sposti* o *rimuova* qualcosa.")
 
 def bootstrap_scheduler(app: Application) -> ReminderScheduler:
-    scheduler = ReminderScheduler(bot_send_callable=lambda chat_id, text: asyncio.run(scheduler_send(chat_id, text)))
+    scheduler = ReminderScheduler(bot_send_callable=scheduler_send)
     scheduler.start()
     return scheduler
 
