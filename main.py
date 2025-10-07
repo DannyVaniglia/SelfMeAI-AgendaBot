@@ -1,19 +1,20 @@
 import os
-from datetime import datetime
 import logging
+from datetime import datetime
+
 import pytz
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import Application, cmd_handler_cls, MessageHandler, ContextTypes, filters
-
 from rapidfuzz import fuzz
 
+from telegram import Update
+from telegram.constants import ParseMode
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+
+# ---- Logging base, visibile su Render ----
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logging.info("boot: main.py loaded")
 
-
-# DB & NLP
+# ---- DB & NLP ----
 from db import (
     init_db,
     get_conn,
@@ -44,7 +45,7 @@ ROME_TZ = pytz.timezone("Europe/Rome")
 
 
 def now_utc_ts() -> int:
-    """Epoch secondi in UTC (timezone-aware)."""
+    """Epoch seconds in UTC (timezone-aware)."""
     return int(datetime.now(pytz.UTC).timestamp())
 
 
@@ -55,7 +56,7 @@ def fmt_event_line(title: str, ts: int) -> str:
 
 
 def find_best_matches(user_id: int, query: str, now_ts: int, limit: int = 5):
-    """Ritorna i migliori match per titolo usando RapidFuzz (≥60)."""
+    """Top match su titolo con RapidFuzz (soglia 60)."""
     events = list_all_future(user_id, now_ts)
     scored = []
     q = (query or "").lower().strip()
@@ -69,12 +70,15 @@ def find_best_matches(user_id: int, query: str, now_ts: int, limit: int = 5):
 
 # -------------------- Globals --------------------
 
-GLOBAL_APP = None
+GLOBAL_APP: Application | None = None
 REM_SCHED: ReminderScheduler | None = None
 
 
 async def scheduler_send(chat_id: int, text: str):
     """Usato dallo scheduler per inviare i promemoria."""
+    if GLOBAL_APP is None:
+        logging.error("scheduler_send: GLOBAL_APP is None")
+        return
     await GLOBAL_APP.bot.send_message(chat_id=chat_id, text=text)
 
 
@@ -108,8 +112,14 @@ async def handle_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     title = strip_date_from_title(text) or "Evento"
     start_ts = int(dt.astimezone(pytz.UTC).timestamp())
     add_event(user_id, chat_id, title, start_ts)
-    REM_SCHED.schedule_event_reminder(chat_id, title, start_ts)
-    await update.message.reply_text(f"✅ Aggiunto: {title} — {dt.strftime('%d/%m/%Y %H:%M')}")
+
+    if REM_SCHED:
+        REM_SCHED.schedule_event_reminder(chat_id, title, start_ts)
+    else:
+        logging.warning("handle_add: REM_SCHED is None, promemoria non pianificato")
+
+    when_str = dt.strftime('%d/%m/%Y %H:%M')
+    await update.message.reply_text(f"✅ Aggiunto: {title} — {when_str}")
 
 
 async def handle_recap(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -119,10 +129,10 @@ async def handle_recap(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not events:
         await update.message.reply_text("Agenda vuota da adesso in poi. ✨")
         return
-    lines = ["🗓️ *Prossimi impegni*:", ""]
+    lines = ["🗓️ <b>Prossimi impegni</b>:", ""]
     for _id, title, start_ts in events[:50]:
         lines.append(fmt_event_line(title, start_ts))
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 async def handle_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -135,7 +145,6 @@ async def handle_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     candidates = []
     if title_guess:
-        # Prima fuzzy, poi LIKE come fallback
         candidates = find_best_matches(user_id, title_guess, now_ts)
         if not candidates:
             candidates = find_candidates_by_title(user_id, title_guess, now_ts)
@@ -150,23 +159,18 @@ async def handle_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not candidates:
         await update.message.reply_text("Non ho trovato eventi da rimuovere. Specifica meglio il titolo o l’orario.")
         return
-    
-    # Disambiguazione: se più di 1 candidato, chiedi numero
+
     if len(candidates) > 1:
-        context.user_data[PENDING_KEY] = {
-            "type": "remove",
-            "candidates": candidates,
-        }
+        context.user_data[PENDING_KEY] = {"type": "remove", "candidates": candidates}
         lines = [
-            "Ho trovato più eventi. Quale intendi rimuovere? Rispondi con *1-{}*:".format(min(5, len(candidates))),
+            "Ho trovato più eventi. Quale intendi rimuovere? Rispondi con <b>1-{}:</b>".format(min(5, len(candidates))),
             "",
         ]
         for i, (_id, title, start_ts) in enumerate(candidates[:5], start=1):
             lines.append(f"{i}) {fmt_event_line(title, start_ts)[2:]}")
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
         return
 
-    # Un solo candidato → rimuovi subito
     event_id, title, start_ts = candidates[0]
     remove_event(event_id)
     await update.message.reply_text(f"🗑️ Rimosso: {title} — {fmt_event_line(title, start_ts)[2:]}")
@@ -194,26 +198,26 @@ async def handle_move(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if len(candidates) > 1:
-        # Salva pending + nuova data
         context.user_data[PENDING_KEY] = {
             "type": "move",
             "candidates": candidates,
             "new_ts": int(new_dt.astimezone(pytz.UTC).timestamp()),
         }
-        lines = ["Quale evento vuoi spostare? Rispondi con *1-{}*:".format(min(5, len(candidates))), ""]
+        lines = ["Quale evento vuoi spostare? Rispondi con <b>1-{}:</b>".format(min(5, len(candidates))), ""]
         for i, (_id, title, start_ts) in enumerate(candidates[:5], start=1):
             lines.append(f"{i}) {fmt_event_line(title, start_ts)[2:]}")
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
         return
 
-    # 1 solo candidato → sposta subito
     event_id, title, old_ts = candidates[0]
     new_ts = int(new_dt.astimezone(pytz.UTC).timestamp())
     update_event_time(event_id, new_ts)
-    REM_SCHED.schedule_event_reminder(chat_id, title, new_ts)
+    if REM_SCHED:
+        REM_SCHED.schedule_event_reminder(chat_id, title, new_ts)
+
     old_line = fmt_event_line(title, old_ts)
     new_line = fmt_event_line(title, new_ts)
-    await update.message.reply_text(f"🔁 Spostato:\n~{old_line}~\n→ {new_line}")
+    await update.message.reply_text(f"🔁 Spostato:<br><s>{old_line}</s><br>→ {new_line}", parse_mode=ParseMode.HTML)
 
 
 async def handle_numeric_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -244,12 +248,12 @@ async def handle_numeric_choice(update: Update, context: ContextTypes.DEFAULT_TY
             context.user_data.pop(PENDING_KEY, None)
             return
         update_event_time(event_id, new_ts)
-        REM_SCHED.schedule_event_reminder(chat_id, title, new_ts)
+        if REM_SCHED:
+            REM_SCHED.schedule_event_reminder(chat_id, title, new_ts)
         old_line = fmt_event_line(title, ts)
         new_line = fmt_event_line(title, new_ts)
-        await update.message.reply_text(f"🔁 Spostato:\n~{old_line}~\n→ {new_line}")
+        await update.message.reply_text(f"🔁 Spostato:<br><s>{old_line}</s><br>→ {new_line}", parse_mode=ParseMode.HTML)
 
-    # pulisci stato
     context.user_data.pop(PENDING_KEY, None)
 
 
@@ -259,33 +263,29 @@ async def fallback_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     intent = detect_intent(text)
 
     if intent == INTENT_ADD:
-        await handle_add(update, context)
-        return
+        await handle_add(update, context); return
     if intent == INTENT_RECAP:
-        await handle_recap(update, context)
-        return
+        await handle_recap(update, context); return
     if intent == INTENT_REMOVE:
-        await handle_remove(update, context)
-        return
+        await handle_remove(update, context); return
     if intent == INTENT_MOVE:
-        await handle_move(update, context)
-        return
+        await handle_move(update, context); return
     if intent == INTENT_HELP:
-        await help_cmd(update, context)
-        return
+        await help_cmd(update, context); return
 
     await update.message.reply_text(
-        "Ok! Dimmi se vuoi che *metta in agenda*, faccia un *recap*, *sposti* o *rimuova* qualcosa."
+        "Dimmi se vuoi che <b>metta in agenda</b>, faccia un <b>recap</b>, <b>sposti</b> o <b>rimuova</b> qualcosa.",
+        parse_mode=ParseMode.HTML,
     )
 
+
 # --- diagnostica ---
-async def ping_cmd(update, context):
+async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong")
 
-async def debug_cmd(update, context):
-    # evita PII nei log
-    from db import get_conn
-    # usa la tua funzione/utilità per timestamp corrente, altrimenti fallback:
+
+async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # niente PII nei log
     now_utc = int(datetime.utcnow().timestamp())
     with get_conn() as conn:
         cur = conn.execute("SELECT COUNT(*) FROM events WHERE start_ts >= ?", (now_utc,))
@@ -306,6 +306,8 @@ def bootstrap_scheduler(app: Application) -> ReminderScheduler:
 
 def schedule_existing_reminders():
     """All’avvio, riprogramma i promemoria per tutti gli eventi futuri."""
+    if REM_SCHED is None:
+        logging.error("schedule_existing_reminders: REM_SCHED is None"); return
     now_ts = now_utc_ts()
     with get_conn() as conn:
         cur = conn.execute(
@@ -325,7 +327,7 @@ def main():
     load_dotenv()
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN mancante nel file .env")
+        raise RuntimeError("TELEGRAM_BOT_TOKEN mancante (setta il Secret su Render o .env in locale)")
 
     init_db()
 
@@ -334,14 +336,12 @@ def main():
     REM_SCHED = bootstrap_scheduler(application)
 
     # Comandi
-    application.add_handler(cmd_handler_cls("start", start))
-    application.add_handler(cmd_handler_cls("help", help_cmd))
-    from telegram.ext import cmd_handler_cls  # se non già importato
-    application.add_handler(cmd_handler_cls("ping", ping_cmd))
-    application.add_handler(cmd_handler_cls("debug", debug_cmd))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_cmd))
+    application.add_handler(CommandHandler("ping", ping_cmd))
+    application.add_handler(CommandHandler("debug", debug_cmd))
 
-
-    # Prima il selettore numerico (più specifico), poi il fallback su testo generico
+    # Prima il selettore numerico, poi il router generale
     application.add_handler(MessageHandler(filters.Regex(r"^[1-5]$"), handle_numeric_choice))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_chat))
 
