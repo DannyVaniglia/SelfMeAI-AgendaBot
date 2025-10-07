@@ -21,22 +21,31 @@ REMOVE_KWS = ["rimuovi", "cancella", "elimina", "togli"]
 MOVE_KWS = ["sposta", "ripianifica", "posticipa", "anticipa", "rimanda", "porta a"]
 HELP_KWS = ["/help", "aiuto"]
 
+# Non includere "agenda" tra le parole del recap!
+RECAP_KWS = ("recap", "riepilogo", "mostra", "lista", "prossimi impegni")
+
+# Riconosci frasi tipo "metti in agenda", "aggiungi in agenda"
+METTI_IN_AGENDA_RE = re.compile(r"\b(metti|aggiungi|inserisci|crea)\s+(in\s+)?agenda\b", re.IGNORECASE)
+
+ADD_KWS = ("metti", "aggiungi", "inserisci", "crea", "ricorda", "ricordami")
+MOVE_KWS = ("sposta", "rimanda", "posticipa", "anticipa", "modifica")
+REMOVE_KWS = ("rimuovi", "cancella", "elimina")
+
 def detect_intent(text: str) -> str:
-    """Decide l'intento in base a frasi chiave; se trova una data senza trigger espliciti, assume 'add'."""
-    t = text.lower()
-    if any(k in t for k in RECAP_KWS):
-        return INTENT_RECAP
+    t = text.lower().strip()
+
+    # ORDINE IMPORTANTE: add/move/remove prima del recap
+    if METTI_IN_AGENDA_RE.search(t) or any(k in t for k in ADD_KWS):
+        return INTENT_ADD
     if any(k in t for k in MOVE_KWS):
         return INTENT_MOVE
     if any(k in t for k in REMOVE_KWS):
         return INTENT_REMOVE
-    if any(k in t for k in ADD_KWS):
-        return INTENT_ADD
-    if any(k in t for k in HELP_KWS):
-        return INTENT_HELP
-    # fallback: se c'è una data/ora riconoscibile, probabilmente è un'aggiunta
-    if search_dates(t, languages=['it']):
-        return INTENT_ADD
+
+    # Recap solo se esplicitamente richiesto (no match "agenda" generico)
+    if any(k in t for k in RECAP_KWS) or t in {"agenda", "agenda?"}:
+        return INTENT_RECAP
+
     return INTENT_UNKNOWN
 
 def extract_datetime(text: str, now_dt: datetime) -> Optional[datetime]:
@@ -62,18 +71,22 @@ def extract_datetime(text: str, now_dt: datetime) -> Optional[datetime]:
     return dt
 
 def strip_date_from_title(text: str) -> str:
-    """
-    Ripulisce il testo da parole di calendario e pattern di date/ore, lasciando il titolo.
-    Esempio: 'metti in agenda domani alle 15 riunione budget' -> 'Riunione Budget'
-    """
-    t = text.lower()
-    for kw in ADD_KWS + ["metti", "aggiungi", "agenda", "calendario", "metti in", "inserisci", "segna"]:
-        t = t.replace(kw, " ")
-    t = re.sub(r"\b(oggi|domani|dopodomani|stamattina|stasera|stanotte|lunedì|martedì|mercoledì|giovedì|venerdì|sabato|domenica)\b", " ", t)
-    t = re.sub(r"\b(\d{1,2}(:\d{2})?)\b", " ", t)
-    t = re.sub(r"\d{1,2}/\d{1,2}(/\d{2,4})?", " ", t)
+    t = METTI_IN_AGENDA_RE.sub(" ", text)
+
+    # Rimuovi verbi di azione per non inquinare il titolo
+    t = re.sub(r"\b(sposta|rimanda|posticipa|anticipa|modifica|rimuovi|cancella|elimina|recap|riepilogo|mostra|lista)\b",
+               " ", t, flags=re.IGNORECASE)
+
+    # Heuristics per togliere riferimenti temporali comuni
+    t = re.sub(r"\b(oggi|domani|dopodomani|stamattina|pomeriggio|stasera|tra|fra|in)\b.*?(?=$|\ball[ea]\b|\bil\b|\bla\b|\bdi\b)",
+               " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\b(?:alle|ore|h)\s*\d{1,2}(?::\d{2})?\b", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\b(lunedì|martedì|mercoledì|giovedì|venerdì|sabato|domenica)\b", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b", " ", t)
+
+    # Pulizia spazi
     t = re.sub(r"\s+", " ", t).strip()
-    return t.title() if t else ""
+    return t.title()
 
 def extract_move_targets(text: str) -> Tuple[Optional[str], Optional[datetime]]:
     """
