@@ -2,7 +2,7 @@ import sqlite3
 from datetime import datetime
 from typing import List, Optional, Tuple
 
-DB_PATH = "data.sqlite"
+DB_PATH = "/var/data/data.sqlite"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
