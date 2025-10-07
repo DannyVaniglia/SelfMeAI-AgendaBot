@@ -5,7 +5,7 @@ import pytz
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, cmd_handler_cls, MessageHandler, ContextTypes, filters
 
 from rapidfuzz import fuzz
 
@@ -334,11 +334,11 @@ def main():
     REM_SCHED = bootstrap_scheduler(application)
 
     # Comandi
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_cmd))
-    from telegram.ext import CommandHandler  # se non già importato
-    application.add_handler(CommandHandler("ping", ping_cmd))
-    application.add_handler(CommandHandler("debug", debug_cmd))
+    application.add_handler(cmd_handler_cls("start", start))
+    application.add_handler(cmd_handler_cls("help", help_cmd))
+    from telegram.ext import cmd_handler_cls  # se non già importato
+    application.add_handler(cmd_handler_cls("ping", ping_cmd))
+    application.add_handler(cmd_handler_cls("debug", debug_cmd))
 
 
     # Prima il selettore numerico (più specifico), poi il fallback su testo generico
