@@ -320,7 +320,9 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_chat))
 
     # Ripristina promemoria esistenti
+    print("📍 boot: prima di schedule_existing_reminders()")
     schedule_existing_reminders()
+    print("📍 boot: dopo schedule_existing_reminders()")
 
     print("✅ Self Me AI — Agenda Bot avviato. Timezone:", os.getenv("TZ", "Europe/Rome"))
     application.run_polling(close_loop=False)
