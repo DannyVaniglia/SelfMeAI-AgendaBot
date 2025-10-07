@@ -10,6 +10,9 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 from db import init_db, add_event, list_all_future, find_candidates_by_title, update_event_time, remove_event
 from nlp import detect_intent, extract_datetime, strip_date_from_title, extract_move_targets, extract_remove_target, INTENT_ADD, INTENT_RECAP, INTENT_REMOVE, INTENT_MOVE, INTENT_HELP
 from scheduler import ReminderScheduler
+from rapidfuzz import fuzz
+PENDING_KEY = "pending_action"
+
 
 ROME_TZ = pytz.timezone("Europe/Rome")
 
@@ -34,6 +37,19 @@ def fmt_event_line(title: str, ts: int) -> str:
     dt = datetime.fromtimestamp(ts, tz=pytz.UTC).astimezone(ROME_TZ)
     date_str = dt.strftime("%a %d/%m/%Y %H:%M")
     return f"• {date_str} — {title}"
+
+def find_best_matches(user_id: int, query: str, now_ts: int, limit: int = 5):
+    """Ritorna i migliori match per titolo usando RapidFuzz (≥60)."""
+    events = list_all_future(user_id, now_ts)
+    scored = []
+    q = (query or "").lower().strip()
+    for eid, title, start_ts in events:
+        score = fuzz.partial_ratio(q, title.lower())
+        if score >= 60:
+            scored.append((score, eid, title, start_ts))
+    scored.sort(reverse=True)
+    return [(eid, title, start_ts) for score, eid, title, start_ts in scored[:limit]]
+
 
 async def handle_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -71,11 +87,14 @@ async def handle_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     title_guess, dt = extract_remove_target(text)
     now_ts = int(datetime.now(pytz.UTC).timestamp())
 
-    candidates = []
+        candidates = []
     if title_guess:
-        candidates = find_candidates_by_title(user_id, title_guess, now_ts)
+        # prima fuzzy, poi LIKE come fallback
+        candidates = find_best_matches(user_id, title_guess, now_ts)
+        if not candidates:
+            candidates = find_candidates_by_title(user_id, title_guess, now_ts)
+
     if not candidates and dt:
-        # se non c'è un match per titolo, prova a cercare per orario vicino ±30m
         t0 = int(dt.astimezone(pytz.UTC).timestamp())
         all_upcoming = list_all_future(user_id, now_ts)
         for _id, title, start_ts in all_upcoming:
@@ -83,8 +102,26 @@ async def handle_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 candidates.append((_id, title, start_ts))
 
     if not candidates:
-        await update.message.reply_text("Non ho trovato eventi da rimuovere. Prova specificando titolo o orario.")
+        await update.message.reply_text("Non ho trovato eventi da rimuovere. Specifica meglio il titolo o l’orario.")
         return
+
+    # ✅ disambiguazione: se più di 1 candidato, chiedi numero
+    if len(candidates) > 1:
+        context.user_data[PENDING_KEY] = {
+            "type": "remove",
+            "candidates": candidates
+        }
+        lines = ["Ho trovato più eventi. Quale intendi rimuovere? Rispondi con *1-{}*:".format(min(5, len(candidates))), ""]
+        for i, (_id, title, start_ts) in enumerate(candidates[:5], start=1):
+            lines.append(f"{i}) {fmt_event_line(title, start_ts)[2:]}")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # altrimenti rimuovi direttamente il primo
+    event_id, title, start_ts = candidates[0]
+    remove_event(event_id)
+    await update.message.reply_text(f"🗑️ Rimosso: {title} — {fmt_event_line(title, start_ts)[2:]}")
+
 
     event_id, title, start_ts = candidates[0]
     remove_event(event_id)
@@ -100,14 +137,39 @@ async def handle_move(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Non ho capito la nuova data/ora. Riprova es. 'sposta ... a martedì alle 11'.")
         return
 
-    now_ts = int(datetime.now(pytz.UTC).timestamp())
+        now_ts = int(datetime.now(pytz.UTC).timestamp())
     candidates = []
     if title_guess:
-        candidates = find_candidates_by_title(user_id, title_guess, now_ts)
+        candidates = find_best_matches(user_id, title_guess, now_ts)
+        if not candidates:
+            candidates = find_candidates_by_title(user_id, title_guess, now_ts)
 
     if not candidates:
         await update.message.reply_text("Non ho trovato quale evento spostare. Specifica meglio il titolo.")
         return
+
+    if len(candidates) > 1:
+        # salva pending + nuova data
+        context.user_data[PENDING_KEY] = {
+            "type": "move",
+            "candidates": candidates,
+            "new_ts": int(new_dt.astimezone(pytz.UTC).timestamp())
+        }
+        lines = ["Quale evento vuoi spostare? Rispondi con *1-{}*:".format(min(5, len(candidates))), ""]
+        for i, (_id, title, start_ts) in enumerate(candidates[:5], start=1):
+            lines.append(f"{i}) {fmt_event_line(title, start_ts)[2:]}")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # 1 solo candidato → sposta subito
+    event_id, title, old_ts = candidates[0]
+    new_ts = int(new_dt.astimezone(pytz.UTC).timestamp())
+    update_event_time(event_id, new_ts)
+    REM_SCHED.schedule_event_reminder(chat_id, title, new_ts)
+    old_line = fmt_event_line(title, old_ts)
+    new_line = fmt_event_line(title, new_ts)
+    await update.message.reply_text(f"🔁 Spostato:\n~{old_line}~\n→ {new_line}")
+
 
     event_id, title, old_ts = candidates[0]
     new_ts = int(new_dt.astimezone(pytz.UTC).timestamp())
@@ -124,6 +186,40 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def fallback_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     intent = detect_intent(text)
+
+async def handle_numeric_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (update.message.text or "").strip()
+    if not msg.isdigit():
+        return
+    if PENDING_KEY not in context.user_data:
+        return
+    choice = int(msg)
+    pending = context.user_data[PENDING_KEY]
+    candidates = pending.get("candidates", [])
+    if choice < 1 or choice > min(5, len(candidates)):
+        await update.message.reply_text("Scelta non valida. Rispondi con un numero della lista.")
+        return
+
+    event_id, title, ts = candidates[choice - 1]
+    typ = pending.get("type")
+    chat_id = update.effective_chat.id
+
+    if typ == "remove":
+        remove_event(event_id)
+        await update.message.reply_text(f"🗑️ Rimosso: {title} — {fmt_event_line(title, ts)[2:]}")
+    elif typ == "move":
+        new_ts = pending.get("new_ts")
+        if not new_ts:
+            await update.message.reply_text("Non ho capito la nuova data/ora, riprova con 'sposta ... a ...'.")
+        else:
+            update_event_time(event_id, new_ts)
+            REM_SCHED.schedule_event_reminder(chat_id, title, new_ts)
+            old_line = fmt_event_line(title, ts)
+            new_line = fmt_event_line(title, new_ts)
+            await update.message.reply_text(f"🔁 Spostato:\n~{old_line}~\n→ {new_line}")
+    # pulisci stato
+    context.user_data.pop(PENDING_KEY, None)
+
 
     if intent == INTENT_ADD:
         await handle_add(update, context); return
@@ -173,6 +269,8 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_chat))
+    application.add_handler(MessageHandler(filters.Regex(r"^[1-5]$"), handle_numeric_choice))
+
 
     schedule_existing_reminders()
 
