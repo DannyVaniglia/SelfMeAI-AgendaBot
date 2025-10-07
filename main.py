@@ -53,7 +53,7 @@ async def handle_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_recap(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    now_ts = int(datetime.utcnow().timestamp())
+    now_ts = int(datetime.now(pytz.UTC).timestamp())
     events = list_all_future(user_id, now_ts)
     if not events:
         await update.message.reply_text("Agenda vuota da adesso in poi. ✨")
@@ -69,7 +69,7 @@ async def handle_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
 
     title_guess, dt = extract_remove_target(text)
-    now_ts = int(datetime.utcnow().timestamp())
+    now_ts = int(datetime.now(pytz.UTC).timestamp())
 
     candidates = []
     if title_guess:
@@ -100,7 +100,7 @@ async def handle_move(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Non ho capito la nuova data/ora. Riprova es. 'sposta ... a martedì alle 11'.")
         return
 
-    now_ts = int(datetime.utcnow().timestamp())
+    now_ts = int(datetime.now(pytz.UTC).timestamp())
     candidates = []
     if title_guess:
         candidates = find_candidates_by_title(user_id, title_guess, now_ts)
@@ -143,15 +143,20 @@ def bootstrap_scheduler(app: Application) -> ReminderScheduler:
     scheduler.start()
     return scheduler
 
+from db import get_conn  # <-- assicurati che sia presente in cima al file
+
 def schedule_existing_reminders():
-    # all'avvio, riprogramma i promemoria futuri già salvati nel DB
-    import sqlite3
-    now_ts = int(datetime.utcnow().timestamp())
-    conn = sqlite3.connect("data.sqlite")
-    cur = conn.execute("SELECT id, chat_id, title, start_ts FROM events WHERE start_ts>=? ORDER BY start_ts ASC", (now_ts,))
-    rows = cur.fetchall()
-    for event_id, chat_id, title, start_ts in rows:
-        REM_SCHED.schedule_event_reminder(chat_id, title, start_ts)
+    # usa lo stesso DB di db.py (Render Disk /var/data/data.sqlite)
+    now_ts = int(datetime.now(pytz.UTC).timestamp())
+    with get_conn() as conn:
+        cur = conn.execute(
+            "SELECT id, chat_id, title, start_ts FROM events WHERE start_ts>=? ORDER BY start_ts ASC",
+            (now_ts,),
+        )
+        rows = cur.fetchall()
+        for event_id, chat_id, title, start_ts in rows:
+            REM_SCHED.schedule_event_reminder(chat_id, title, start_ts)
+
 
 def main():
     global GLOBAL_APP, REM_SCHED
