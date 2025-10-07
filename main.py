@@ -1,5 +1,6 @@
 import os
 from datetime import datetime
+import logging
 import pytz
 from dotenv import load_dotenv
 from telegram import Update
@@ -7,6 +8,10 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 from rapidfuzz import fuzz
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.info("boot: main.py loaded")
+
 
 # DB & NLP
 from db import (
@@ -273,6 +278,23 @@ async def fallback_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Ok! Dimmi se vuoi che *metta in agenda*, faccia un *recap*, *sposti* o *rimuova* qualcosa."
     )
 
+# --- diagnostica ---
+async def ping_cmd(update, context):
+    await update.message.reply_text("pong")
+
+async def debug_cmd(update, context):
+    # evita PII nei log
+    from db import get_conn
+    # usa la tua funzione/utilità per timestamp corrente, altrimenti fallback:
+    now_utc = int(datetime.utcnow().timestamp())
+    with get_conn() as conn:
+        cur = conn.execute("SELECT COUNT(*) FROM events WHERE start_ts >= ?", (now_utc,))
+        cnt = cur.fetchone()[0]
+    tz = os.getenv("TZ", "Europe/Rome")
+    await update.message.reply_text(
+        f"✅ Debug\n- TZ: {tz}\n- Eventi futuri: {cnt}\n- Ora UTC: {datetime.utcnow().isoformat()}Z"
+    )
+
 
 # -------------------- Scheduler bootstrap --------------------
 
@@ -314,6 +336,10 @@ def main():
     # Comandi
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_cmd))
+    from telegram.ext import CommandHandler  # se non già importato
+    application.add_handler(CommandHandler("ping", ping_cmd))
+    application.add_handler(CommandHandler("debug", debug_cmd))
+
 
     # Prima il selettore numerico (più specifico), poi il fallback su testo generico
     application.add_handler(MessageHandler(filters.Regex(r"^[1-5]$"), handle_numeric_choice))
